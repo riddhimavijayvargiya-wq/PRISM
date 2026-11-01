@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Prism</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 1100px; margin: 40px auto; padding: 0 20px; }
+    .tabs { display: flex; gap: 10px; margin-bottom: 20px; }
+    .tabs button { padding: 8px 16px; cursor: pointer; }
+    .tabs button.active { font-weight: bold; border-bottom: 2px solid #333; }
+    textarea { width: 100%; height: 70px; margin-bottom: 10px; }
+    .row { display: flex; gap: 10px; margin-bottom: 10px; align-items: center; }
+    table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid #ddd; vertical-align: top; }
+th { background: #f5f5f5; font-size: 13px; text-transform: uppercase; color: #555; }
+.score { font-weight: bold; padding: 2px 8px; border-radius: 4px; display: inline-block; }
+.score-high { background: #d4edda; color: #1e7e34; }
+.score-mid { background: #fff3cd; color: #856404; }
+.score-low { background: #f8d7da; color: #b02a37; }
+.answer-row { display: none; background: #fafafa; }
+.answer-row td { padding: 16px; }
+tr.summary-row { cursor: pointer; }
+tr.summary-row:hover { background: #f0f0f0; }
+.matrix td { text-align: center; font-size: 18px; }
+  .matrix td:first-child { text-align: left; font-size: 14px; }
+  .gap { font-size: 11px; color: #856404; margin-left: 8px; }
+  .legend { font-size: 12px; color: #555; margin: 10px 0 24px; }
+  h3.section { margin-top: 28px; }
+.meta-small { font-size: 12px; color: #666; margin-top: 8px; }
+    .card h3 { margin-top: 0; }
+    .meta { font-size: 12px; color: #666; margin-top: 8px; }
+    .error { color: #b00020; }
+  </style>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/contrib/auto-render.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/9.1.6/marked.min.js"></script>
+</head>
+<body>
+  <h1>Prism</h1>
+
+  <div class="tabs">
+    <button id="tab-rag" class="active" onclick="switchTab('rag')">RAG Playground</button>
+    <button id="tab-llm" onclick="switchTab('llm')">LLM Playground</button>
+  </div>
+
+  <div id="panel-rag">
+    <textarea id="rag-question" placeholder="Ask a question..."></textarea>
+    <div class="row">
+      <label>Model:</label>
+      <select id="rag-model">
+        <option value="gemini-3.6-flash">gemini-3.6-flash</option>
+        <option value="gemini-3.5-flash">gemini-3.5-flash</option>
+        <option value="gemini-3.5-flash-lite">gemini-3.5-flash-lite</option>
+      </select>
+      <button onclick="runRagPlayground()">Compare Pipelines</button>
+    </div>
+  </div>
+  
+  <div id="panel-llm" style="display:none;">
+    <textarea id="llm-question" placeholder="Ask a question..."></textarea>
+    <div class="row">
+      <label>Pipeline:</label>
+      <select id="llm-pipeline">
+        <option value="A">A (Precision)</option>
+        <option value="B">B (Context-rich)</option>
+        <option value="C">C (Hybrid + rerank)</option>
+      </select>
+      <button onclick="runLlmPlayground()">Compare Models</button>
+    </div>
+  </div>
+
+  <div id="results" class="results"></div>
+
+  <script>
+    const API_BASE = "http://localhost:8000";
+
+    function switchTab(tab) {
+      document.getElementById('panel-rag').style.display = tab === 'rag' ? 'block' : 'none';
+      document.getElementById('panel-llm').style.display = tab === 'llm' ? 'block' : 'none';
+      document.getElementById('tab-rag').classList.toggle('active', tab === 'rag');
+      document.getElementById('tab-llm').classList.toggle('active', tab === 'llm');
+      document.getElementById('results').innerHTML = '';
+    }
+
+    const BUCKETS = {
+  covered:         { icon: '✅', label: 'Covered: in context and in answer' },
+  generation_miss: { icon: '⚠️', label: 'Generation miss: in context, not in answer' },
+  retrieval_miss:  { icon: '❌', label: 'Retrieval miss: not in context, not in answer' },
+  unsupported:     { icon: '🚩', label: 'Unsupported: in answer, not in context' }
+};
+
+function esc(s) {
+  return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/\s*\n\s*/g, ' ');
+}
+
+function pill(num, den) {
+  if (!den) return '–';
+  const r = num / den;
+  const cls = r >= 0.8 ? 'score-high' : r >= 0.5 ? 'score-mid' : 'score-low';
+  return `<span class="score ${cls}">${num}/${den}</span>`;
+}
+
+function renderResults(results, labelKey) {
+  const container = document.getElementById('results');
+  container.innerHTML = '';
+
+  // In the LLM Playground retrieval is identical across rows, so retrieval
+  // columns would only add noise there.
+  const showRetrieval = labelKey === 'pipeline';
+  const sorted = [...results].sort((a, b) => String(a[labelKey]).localeCompare(String(b[labelKey])));
+
+  const cols = [
+    { key: 'label', head: labelKey === 'pipeline' ? 'Pipeline' : 'Model', show: true },
+    { key: 'ctx', head: 'Context coverage', tip: 'Checklist points present in the retrieved context (retrieval quality)', show: showRetrieval, eval: true },
+    { key: 'ans', head: 'Answer coverage', tip: 'Checklist points the answer states', show: true, eval: true },
+    { key: 'eff', head: 'Generation efficiency', tip: 'Of the points available in context, how many the answer used (generation quality)', show: true, eval: true },
+    { key: 'uns', head: 'Unsupported', tip: 'Claims in the answer that the context does not support', show: true, eval: true },
+    { key: 'ref', head: 'Refused', show: true, eval: true },
+    { key: 'src', head: 'Sources', show: showRetrieval },
+    { key: 'words', head: 'Context (words)', show: showRetrieval },
+    { key: 'lat', head: 'Latency', show: true },
+    { key: 'cost', head: 'Cost', show: true }
+  ].filter(c => c.show);
+  const evalCols = cols.filter(c => c.eval).length;
+
+  const table = document.createElement('table');
+  table.innerHTML = `<thead><tr>${cols.map(c => `<th title="${esc(c.tip || '')}">${c.head}</th>`).join('')}</tr></thead><tbody></tbody>`;
+  const tbody = table.querySelector('tbody');
+
+  sorted.forEach(r => {
+    const summaryRow = document.createElement('tr');
+    summaryRow.className = 'summary-row';
+    const answerRow = document.createElement('tr');
+    answerRow.className = 'answer-row';
+
+    if (r.error) {
+      summaryRow.innerHTML = `<td><strong>${esc(r[labelKey])}</strong></td><td colspan="${cols.length - 1}" class="error">${esc(r.error)}</td>`;
+    } else {
+      const aspects = r.aspects || [];
+      const n = aspects.length;
+      const ctx = aspects.filter(a => a.in_context).length;
+      const ans = aspects.filter(a => a.in_answer).length;
+      const cov = aspects.filter(a => a.bucket === 'covered').length;
+      const unsupported = r.unsupported_claims || [];
+
+      const values = {
+        label: `<strong>${esc(r[labelKey])}</strong>`,
+        ctx: pill(ctx, n),
+        ans: pill(ans, n),
+        eff: pill(cov, ctx),
+        uns: unsupported.length
+          ? `<span class="score score-low" title="${unsupported.map(esc).join('&#10;')}">${unsupported.length}</span>` : '0',
+        ref: r.refused === true
+          ? (r.false_refusal ? 'Yes ⚠️<div class="meta-small">context had the info</div>' : 'Yes')
+          : (r.refused === false ? 'No' : '–'),
+        src: `${r.source_diversity} distinct doc${r.source_diversity === 1 ? '' : 's'}`,
+        words: r.context_volume,
+        lat: `${(r.total_latency_ms / 1000).toFixed(1)}s`,
+        cost: `$${r.cost_usd.toFixed(4)}`
+      };
+
+      let html = '';
+      let failureShown = false;
+      cols.forEach(c => {
+        if (c.eval && r.evaluation_error) {
+          if (!failureShown) {
+            html += `<td colspan="${evalCols}" class="error" title="${esc(r.evaluation_error)}">Evaluation failed</td>`;
+            failureShown = true;
+          }
+          return;
+        }
+        html += `<td>${values[c.key]}</td>`;
+      });
+      summaryRow.innerHTML = html;
+
+      answerRow.innerHTML = `
+        <td colspan="${cols.length}">
+          <div>${marked.parse(r.answer)}</div>
+          <div class="meta-small">Sources: ${esc([...new Set(r.sources)].join(', '))}</div>
+          ${unsupported.length ? `<div class="meta-small error">Unsupported claims: ${unsupported.map(esc).join('; ')}</div>` : ''}
+        </td>`;
+    }
+
+    summaryRow.onclick = () => {
+      answerRow.style.display = answerRow.style.display === 'table-row' ? 'none' : 'table-row';
+    };
+    tbody.appendChild(summaryRow);
+    tbody.appendChild(answerRow);
+  });
+  container.appendChild(table);
+
+  // ---- Checklist matrix: points a complete answer needs x each pipeline/model ----
+  const evaluated = sorted.filter(r => !r.error && !r.evaluation_error && (r.aspects || []).length);
+  if (evaluated.length) {
+    const heading = document.createElement('h3');
+    heading.className = 'section';
+    heading.textContent = 'Checklist: what each one covered';
+    container.appendChild(heading);
+
+    const matrix = document.createElement('table');
+    matrix.className = 'matrix';
+    let html = `<thead><tr><th>Point a complete answer needs</th>${sorted.map(r => `<th>${esc(r[labelKey])}</th>`).join('')}</tr></thead><tbody>`;
+
+    evaluated[0].aspects.forEach((aspect, i) => {
+      // If every pipeline missed it in context, it's likely a corpus gap, not a pipeline difference
+      const allMissed = evaluated.length >= 2 && evaluated.every(r => r.aspects[i] && r.aspects[i].bucket === 'retrieval_miss');
+      html += `<tr><td>${esc(aspect.text)}${allMissed ? '<span class="gap">not in any retrieved context</span>' : ''}</td>`;
+      sorted.forEach(r => {
+        const a = (r.aspects || [])[i];
+        if (!a) { html += '<td>–</td>'; return; }
+        const b = BUCKETS[a.bucket];
+        const tip = `${b.label}&#10;Context: ${esc(a.context_evidence)}&#10;Answer: ${esc(a.answer_evidence)}`;
+        html += `<td title="${tip}">${b.icon}</td>`;
+      });
+      html += '</tr>';
+    });
+    matrix.innerHTML = html + '</tbody>';
+    container.appendChild(matrix);
+
+    const legend = document.createElement('div');
+    legend.className = 'legend';
+    legend.textContent = '✅ covered · ⚠️ generation miss (in context, not in answer) · ❌ retrieval miss (not in context) · 🚩 unsupported (in answer, not in context). Hover a cell for the judge\'s evidence.';
+    container.appendChild(legend);
+  }
+
+  renderMathInElement(container, {
+    delimiters: [
+      { left: "$$", right: "$$", display: true },
+      { left: "$", right: "$", display: false }
+    ]
+  });
+}
+
+function renderResults(results, labelKey) {
+  const container = document.getElementById('results');
+  container.innerHTML = '';
+
+  const table = document.createElement('table');
+  table.innerHTML = `
+    <thead>
+      <tr>
+        <th>${labelKey === 'pipeline' ? 'Pipeline' : 'Model'}</th>
+        <th>Groundedness</th>
+        <th>Relevance</th>
+        <th>Completeness</th>
+        <th>Sources</th>
+        <th>Context (words)</th>
+        <th>Latency</th>
+        <th>Cost</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  `;
+  const tbody = table.querySelector('tbody');
+
+  results.forEach((r, i) => {
+    const summaryRow = document.createElement('tr');
+    summaryRow.className = 'summary-row';
+
+    if (r.error) {
+      summaryRow.innerHTML = `
+        <td><strong>${r[labelKey]}</strong></td>
+        <td colspan="7" class="error">${r.error}</td>`;
+    } else {
+      summaryRow.innerHTML = `
+        <td><strong>${r[labelKey]}</strong></td>
+        <td><span class="score ${scoreClass(r.groundedness)}">${r.groundedness}/5</span></td>
+        <td><span class="score ${scoreClass(r.relevance)}">${r.relevance}/5</span></td>
+        <td><span class="score ${scoreClass(r.completeness)}">${r.completeness}/5</span></td>
+        <td>${r.source_diversity} distinct doc${r.source_diversity === 1 ? '' : 's'}</td>
+        <td>${r.context_volume}</td>
+        <td>${(r.total_latency_ms / 1000).toFixed(1)}s</td>
+        <td>$${r.cost_usd.toFixed(4)}</td>`;
+    }
+
+    const answerRow = document.createElement('tr');
+    answerRow.className = 'answer-row';
+    if (!r.error) {
+      answerRow.innerHTML = `
+        <td colspan="8">
+          <div>${marked.parse(r.answer)}</div>
+          <div class="meta-small">
+            Sources: ${[...new Set(r.sources)].join(', ')}<br>
+            Judge reasoning: ${r.judge_reasoning || 'n/a'}
+          </div>
+        </td>`;
+    }
+
+    summaryRow.onclick = () => {
+      answerRow.style.display = answerRow.style.display === 'table-row' ? 'none' : 'table-row';
+    };
+
+    tbody.appendChild(summaryRow);
+    tbody.appendChild(answerRow);
+  });
+
+  container.appendChild(table);
+
+  renderMathInElement(container, {
+    delimiters: [
+      {left: "$$", right: "$$", display: true},
+      {left: "$", right: "$", display: false}
+    ]
+  });
+}
+
+
+
+    async function runRagPlayground() {
+      const question = document.getElementById('rag-question').value;
+      const model = document.getElementById('rag-model').value;
+      document.getElementById('results').innerHTML = '<p>Running...</p>';
+
+      const res = await fetch(`${API_BASE}/rag-playground`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question, model })
+      });
+      const data = await res.json();
+      renderResults(data.results, 'pipeline');
+    }
+
+    async function runLlmPlayground() {
+      const question = document.getElementById('llm-question').value;
+      const pipeline = document.getElementById('llm-pipeline').value;
+      const models = ["gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite"];
+      document.getElementById('results').innerHTML = '<p>Running...</p>';
+
+      const res = await fetch(`${API_BASE}/llm-playground`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question, pipeline, models })
+      });
+      const data = await res.json();
+      renderResults(data.results, 'model');
+    }
+  </script>
+</body>
+</html>

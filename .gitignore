@@ -1,0 +1,16 @@
+# Secrets
+.env
+
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Local data, rebuilt by the ingestion scripts
+/data/
+/corpus/
+/hf_corpus/
+
+# Exports and OS files
+comparison_export.csv
+.DS_Store
